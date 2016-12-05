@@ -5,7 +5,6 @@
 #include <netinet/in.h>
 #include <string.h>
 #include <arpa/inet.h>
-
 #include "c37118.h"
 #include "c37118configuration.h"
 #include "c37118pmustation.h"
@@ -14,7 +13,8 @@
 #include "c37118command.h"
 #include <unistd.h>
 #include <iostream>
-#include <sstream>
+#include "rapidjson/writer.h"
+#include "rapidjson/stringbuffer.h"
 #include "kafkaproducer.h"
 
 #define A_SYNC_AA 0xAA     
@@ -27,9 +27,11 @@
 #define SIZE_BUFFER 65535
 #define TCP_PORT 5000
 
+// using namespace rapidjson;
 
 /**
-* Send request to PMUs and Process Socket Packet C37.118-2011
+* Send request to PMUs and parse config, header, data frames(SEE C37.118-2011 for details)
+* Use rapidjson to package data and write to kafka
 */
 int main(int argc, char *argv[] ){
     int sockfd, newsockfd, portno, clilen;
@@ -39,7 +41,9 @@ int main(int argc, char *argv[] ){
     int  n;
     unsigned short size ;
     std::string pmutopic="PMU_DATA";
-    std::ostringstream oss;
+    rapidjson::StringBuffer dataToJson;
+    rapidjson::Writer<rapidjson::StringBuffer> writer(dataToJson);
+    // std::ostringstream oss;
 
     //PMU	
     CMD_Frame *my_cmd = new CMD_Frame();
@@ -47,7 +51,7 @@ int main(int argc, char *argv[] ){
     CONFIG_1_Frame *my_config1 = new CONFIG_1_Frame();
     HEADER_Frame *my_header = new HEADER_Frame("");
 
-    /* First call to socket() function */
+    /* Setup socket() function */
     sockfd = socket(AF_INET, SOCK_STREAM, 0);
     int on =1;
     int status = setsockopt(sockfd, SOL_SOCKET,SO_REUSEADDR, (const char *) &on, sizeof(on));
@@ -105,19 +109,24 @@ int main(int argc, char *argv[] ){
     size = read(sockfd, buffer_rx, SIZE_BUFFER);
     my_header->unpack(buffer_rx);
     cout << "INFO: " << my_header->DATA_get() << endl;
-    oss << "INFO: " << my_header->DATA_get() << endl;
-        
+
+    writer.StartObject(); 
+    writer.Key("INFO");
+    writer.String(my_header->DATA_get().c_str()); 
+            
     PMU_Station *pmu_aux;
     pmu_aux = my_config2->PMUSTATION_GETbyIDCODE(2);
     cout << "PMU: " << pmu_aux->STN_get() << endl;
-    oss << "PMU: " << pmu_aux->STN_get() << endl;
-        
+    writer.Key("PMU");
+    writer.String((my_header->DATA_get()).c_str());
+            
     // Enable DATA ON 
     my_cmd->CMD_set(0x02);
     size = my_cmd->pack(&buffer_tx);
     n = write(sockfd,buffer_tx,size); 
     if (n < 0) {
     	    perror("ERROR writing to socket");
+            writer.EndObject();
             exit(1);
     }
     
@@ -126,25 +135,29 @@ int main(int argc, char *argv[] ){
     for(i = 0 ; i < 10 ; i++){
     	size = read(sockfd, buffer_rx, SIZE_BUFFER);
         if (size > 0) {
-        my_data->unpack(buffer_rx);
+            my_data->unpack(buffer_rx);
 
-        cout << "PMU Data Stream"<< endl;
-        for (k =0 ; k < pmu_aux->PHNMR_get(); k++){
-        	    cout << pmu_aux->PH_NAME_get(k) << ":" << abs(pmu_aux->PHASOR_VALUE_get(k)) <<"|_ " << arg(pmu_aux->PHASOR_VALUE_get(k))*180/M_PI << endl;
-                oss << pmu_aux->PH_NAME_get(k) << ":" << abs(pmu_aux->PHASOR_VALUE_get(k)) <<"|_ " << arg(pmu_aux->PHASOR_VALUE_get(k))*180/M_PI << endl;
-                // sendToKafka(pmutopic, pmu_aux->PH_NAME_get(k));                
+            cout << "PMU Data Stream"<< endl;
+            for (k =0 ; k < pmu_aux->PHNMR_get(); k++){
+            	    cout << pmu_aux->PH_NAME_get(k) << ":" << abs(pmu_aux->PHASOR_VALUE_get(k)) <<"|_ " << arg(pmu_aux->PHASOR_VALUE_get(k))*180/M_PI << endl;
+                    writer.Key((pmu_aux->PH_NAME_get(k)).c_str());
+                    writer.Double(abs(pmu_aux->PHASOR_VALUE_get(k)));
+                    writer.Key("Phase");
+                    writer.Double(arg(pmu_aux->PHASOR_VALUE_get(k))*180/M_PI);
+                    //oss << pmu_aux->PH_NAME_get(k) << ":" << abs(pmu_aux->PHASOR_VALUE_get(k)) <<"|_ " << arg(pmu_aux->PHASOR_VALUE_get(k))*180/M_PI << endl;
+                    // sendToKafka(pmutopic, pmu_aux->PH_NAME_get(k));                
+            }
+            for (k =0 ; k < pmu_aux->ANNMR_get(); k++){
+            	    cout << pmu_aux->AN_NAME_get(k) << ":" << pmu_aux->ANALOG_VALUE_get(k) << endl;
+                    writer.Key((pmu_aux->AN_NAME_get(k)).c_str());
+                    writer.Double(pmu_aux->ANALOG_VALUE_get(k));
+                    //oss << pmu_aux->AN_NAME_get(k) << ":" << pmu_aux->ANALOG_VALUE_get(k) << endl;
+            }           
         }
-        for (k =0 ; k < pmu_aux->ANNMR_get(); k++){
-        	    cout << pmu_aux->AN_NAME_get(k) << ":" << pmu_aux->ANALOG_VALUE_get(k) << endl;
-                oss << pmu_aux->AN_NAME_get(k) << ":" << pmu_aux->ANALOG_VALUE_get(k) << endl;
-        }
-
-           // cout << "Analog Value: " << my_data->associate_current_config->pmu_station_list[0]->ANALOG_VALUE_get(0) <<endl << endl;
-            //cout << "Analog Value: " << my_data->associate_current_config->pmu_station_list[0]->ANALOG_VALUE_get(1) <<endl;
-          }
     }
 
-    sendToKafka(pmutopic,oss.str());
+    writer.EndObject();
+    sendToKafka(pmutopic,dataToJson.GetString());
     
     // Enable DATA OFF 
     my_cmd->CMD_set(0x01);
